@@ -18,6 +18,7 @@ String Tags
  * ``~encoding``: Encoder name, version, settings used (e.g. "LAME 3.97.0, VBR")
  * ``~length``: The length of the file in H:MM:SS format
  * ``~mountpoint``: The component of the full path name that corresponds to the file's immediate parent mount
+ * ``~firstartist``: The first artist, derived from the ``artist`` tag(s) in stored order
  * ``~performers``: A list of performers
  * ``~people``: A list of all people involved in the song
  * ``~rating``: A string representation of the song's rating (e.g. ★★★☆). Note that in most formats these are per email address.

@@ -560,6 +560,28 @@ class TAudioFile(TestCase):
             ],
         )
 
+    def test_firstartist(self):
+        song = AudioFile(
+            {
+                "artist": "Björk, A & B\nSecond Artist\nThird Artist",
+                "albumartist": "Album Artist",
+            }
+        )
+        self.assertEqual(song("~firstartist"), "Björk, A & B")
+        self.assertEqual(song.list("~firstartist"), ["Björk, A & B"])
+        self.assertEqual(song("artist"), "Björk, A & B\nSecond Artist\nThird Artist")
+        song["artist"] = "Only Artist"
+        self.assertEqual(song("~firstartist"), "Only Artist")
+        song["artist"] = "\nFirst Artist\nSecond Artist"
+        self.assertEqual(song("~firstartist"), "First Artist")
+        for artist in ("", "\n"):
+            song["artist"] = artist
+            self.assertEqual(song("~firstartist", "fallback"), "fallback")
+            self.assertEqual(song.list("~firstartist"), [])
+        del song["artist"]
+        self.assertEqual(song("~firstartist"), "")
+        self.assertEqual(song("~firstartist", "fallback"), "fallback")
+
     def test_people_individuals(self):
         q = AudioFile({"artist": "A\nX", "albumartist": "Various Artists"})
         self.assertEqual(q.list("~people:real"), ["A", "X"])

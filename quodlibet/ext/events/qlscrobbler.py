@@ -12,17 +12,19 @@
 # the Free Software Foundation; either version 2 of the License, or
 # (at your option) any later version.
 
+import json
 import os
 import threading
 import time
 from hashlib import md5
+from urllib.error import HTTPError
 from urllib.parse import urlencode
 
 from gi.repository import Gtk, GLib
 
 import quodlibet
 from quodlibet import _
-from quodlibet import const, app, util, qltk
+from quodlibet import app, qltk
 from quodlibet.pattern import Pattern
 from quodlibet.query import Query
 from quodlibet.plugins.events import EventPlugin
@@ -32,16 +34,17 @@ from quodlibet.qltk.msg import Message
 from quodlibet.qltk import Icons
 from quodlibet.util.dprint import print_d, print_w
 from quodlibet.util.picklehelper import pickle_load, pickle_dump, PickleError
-from quodlibet.util.urllib import urlopen, UrllibError
+from quodlibet.util.urllib import urlopen
 from quodlibet.errorreport import errorhook
 
 SERVICES = {
-    "Last.fm": "https://post.audioscrobbler.com/",
-    "Libre.fm": "https://turtle.libre.fm/",
+    "Last.fm": "https://ws.audioscrobbler.com/2.0/",
+    "Libre.fm": "https://libre.fm/2.0/",
 }
 
 DEFAULT_SERVICE = "Last.fm"
 DEFAULT_TITLEPAT = "<title><version| (<version>)>"
+DEFAULT_ALBUMARTISTPAT = "<albumartist>"
 DEFAULT_ARTISTPAT = "<artist|<artist>|<composer|<composer>|<performer>>>"
 
 plugin_config = PluginConfig("scrobbler")
@@ -49,11 +52,14 @@ defaults = plugin_config.defaults
 defaults.set("service", DEFAULT_SERVICE)
 defaults.set("titlepat", "")
 defaults.set("artistpat", "")
+defaults.set("albumartistpat", "")
 defaults.set("url", "")
 defaults.set("username", "")
 defaults.set("password", "")
 defaults.set("exclude", "")
 defaults.set("offline", False)
+defaults.set("api_key", "")
+defaults.set("api_secret", "")
 
 
 def config_get_url():
@@ -76,15 +82,16 @@ def config_get_artist_pattern():
     return plugin_config.get("artistpat") or DEFAULT_ARTISTPAT
 
 
+def config_get_albumartist_pattern():
+    return plugin_config.get("albumartistpat") or DEFAULT_ALBUMARTISTPAT
+
+
 class QLSubmitQueue:
     """Manages the submit queue for scrobbles. Works independently of the
     QLScrobbler plugin being enabled; other plugins may use submit() to queue
     songs for scrobbling.
     """
 
-    CLIENT = "qlb"
-    CLIENT_VERSION = const.VERSION
-    PROTOCOL_VERSION = "1.2"
     SCROBBLER_CACHE_FILE = os.path.join(quodlibet.get_user_dir(), "scrobbler_cache_v2")
 
     # These objects are shared across instances, to allow other plugins to
@@ -94,6 +101,7 @@ class QLSubmitQueue:
 
     def set_nowplaying(self, song):
         """Send a Now Playing notification."""
+        self._check_config()
         formatted = self._format_song(song)
         if not formatted or self.nowplaying_song == formatted:
             return
@@ -104,6 +112,7 @@ class QLSubmitQueue:
     def submit(self, song, timestamp=0):
         """Submit a song. If 'timestamp' is 0, the current time will
         be used."""
+        self._check_config()
         formatted = self._format_song(song)
         if formatted is None:
             return
@@ -120,12 +129,13 @@ class QLSubmitQueue:
     def _format_song(self, song):
         """Returns a dict with the keys formatted as required by spec."""
         store = {
-            "l": str(song.get("~#length", 0)),
+            "l": str(int(song.get("~#length", 0))),
             "n": str(song("~#track")),
             "b": song.comma("album"),
             "m": song("musicbrainz_trackid"),
             "t": self.titlepat.format(song),
             "a": self.artpat.format(song),
+            "albumArtist": self.albumartpat.format(song),
         }
 
         # Spec requires title and artist at minimum
@@ -136,20 +146,21 @@ class QLSubmitQueue:
     def __init__(self):
         self.nowplaying_song = None
         self.nowplaying_sent = False
-        self.sessionid = None
         self.handshake_event = None
         self.handshake_delay = 1.0
         self.failures = 0
         self.handshake_sent = 0
-        self.session_id, self.nowplaying_url, self.submit_url = None, None, None
 
         self.broken = False
+        self.api_credentials = ("", "")
+        self.api_session = None
 
         self.username, self.password, self.base_url = ("", "", "")
 
         # These need to be set early for _format_song to work
         self.titlepat = Pattern(config_get_title_pattern())
         self.artpat = Pattern(config_get_artist_pattern())
+        self.albumartpat = Pattern(config_get_albumartist_pattern())
 
         self._load_queue()
 
@@ -174,26 +185,34 @@ class QLSubmitQueue:
 
     def _check_config(self):
         user = plugin_config.get("username")
-        passw = md5(plugin_config.getbytes("password")).hexdigest()
+        password = plugin_config.get("password")
         url = config_get_url()
-        if not user or not passw or not url:
-            if self.queue and not self.broken:
+        credentials = (plugin_config.get("api_key"), plugin_config.get("api_secret"))
+        settings = (user, password, url, credentials)
+        if settings != (
+            self.username,
+            self.password,
+            self.base_url,
+            self.api_credentials,
+        ):
+            self.username, self.password, self.base_url, self.api_credentials = settings
+            self.broken = False
+            self.handshake_sent = False
+            self.api_session = None
+        if not (user and password and all(credentials) and url.startswith("https://")):
+            if not self.broken and (self.queue or self.nowplaying_song):
                 self.quick_dialog(
                     _(
-                        "Please visit the Plugins window to set "
-                        "QLScrobbler up. Until then, songs will not be "
-                        "submitted."
+                        "Please configure a username, password, API key and API secret "
+                        "and an HTTPS API URL in the AudioScrobbler preferences."
                     ),
                     Gtk.MessageType.INFO,
                 )
-                self.broken = True
-        elif (self.username, self.password, self.base_url) != (user, passw, url):
-            self.username, self.password, self.base_url = (user, passw, url)
-            self.broken = False
-            self.handshake_sent = False
+            self.broken = True
         self.offline = plugin_config.getboolean("offline")
         self.titlepat = Pattern(config_get_title_pattern())
         self.artpat = Pattern(config_get_artist_pattern())
+        self.albumartpat = Pattern(config_get_albumartist_pattern())
 
     def changed(self):
         """Signal that settings or queue contents were changed."""
@@ -236,133 +255,108 @@ class QLSubmitQueue:
                     self.failures = 0
                 else:
                     self.failures += 1
+                    self.changed_event.clear()
+                    GLib.timeout_add_seconds(60, self.changed)
                     if self.failures >= 3:
                         self.handshake_sent = False
             elif self.nowplaying_song and not self.nowplaying_sent:
-                self.send_nowplaying()
-                self.nowplaying_sent = True
+                self.nowplaying_sent = self.send_nowplaying()
+                if not self.nowplaying_sent:
+                    self.changed_event.clear()
+                    GLib.timeout_add_seconds(60, self.changed)
             else:
                 # Nothing left to do; wait until something changes
                 self.changed_event.clear()
 
     def send_handshake(self, show_dialog=False):
-        # construct url
-        stamp = int(time.time())
-        auth = md5(
-            self.password.encode("utf-8") + str(stamp).encode("utf-8")
-        ).hexdigest()
-        qp = {
-            "hs": "true",
-            "p": self.PROTOCOL_VERSION,
-            "c": self.CLIENT,
-            "v": self.CLIENT_VERSION,
-            "u": self.username,
-            "a": auth,
-            "t": int(stamp),
-        }
-        qs = urlencode(qp)
-        url = f"{self.base_url}/?{qs}"
-        print_d(f"Sending handshake to service at {self.base_url}.")
-
-        try:
-            resp = urlopen(url)
-        except UrllibError:
-            if show_dialog:
-                self.quick_dialog(
-                    _("Could not contact service '%s'.") % util.escape(self.base_url),
-                    Gtk.MessageType.ERROR,
-                )
-            else:
-                print_d("Could not contact service. Queueing submissions.")
+        """Authenticate against the Scrobbling 2.0 API."""
+        if self.broken:
             return False
-        except ValueError:
-            self.quick_dialog(
-                _("Authentication failed: invalid URL."), Gtk.MessageType.ERROR
-            )
-            self.broken = True
-            return False
-
-        # check response
-        lines = resp.read().decode("utf-8", "ignore").rstrip().split("\n")
-        status = lines.pop(0)
-
-        if status == "OK":
-            self.session_id, self.nowplaying_url, self.submit_url = lines
+        response = self._api_request(
+            "auth.getMobileSession",
+            {"username": self.username, "password": self.password},
+        )
+        session = response.get("session") if response else None
+        if isinstance(session, dict) and session.get("key"):
+            self.api_session = session["key"]
             self.handshake_sent = True
-            print_d(
-                f"Session ID: {self.session_id}, "
-                f"NP URL: {self.nowplaying_url}, "
-                f"Submit URL: {self.submit_url}"
-            )
             return True
-        print_w(f"Bad handshake status: {status}")
-        if status == "BADAUTH":
+        if show_dialog:
             self.quick_dialog(
-                _("Authentication failed: Invalid username '%s' or bad password.")
-                % util.escape(self.username),
+                _("Authentication failed. Check your account and API credentials."),
                 Gtk.MessageType.ERROR,
             )
-            self.broken = True
-        elif status == "BANNED":
-            self.quick_dialog(
-                _("Client is banned. Contact the author."), Gtk.MessageType.ERROR
-            )
-            self.broken = True
-        elif status == "BADTIME":
-            self.quick_dialog(
-                _("Wrong system time. Submissions may fail until it is corrected."),
-                Gtk.MessageType.ERROR,
-            )
-        else:  # "FAILED"
-            self.quick_dialog(util.escape(status), Gtk.MessageType.ERROR)
-        self.changed()
         return False
 
-    def _check_submit(self, url, data):
-        data_str = urlencode(data).encode("ascii")
+    def _api_request(self, method, params):
+        params = dict(params, method=method, api_key=self.api_credentials[0])
+        signature = "".join(key + str(params[key]) for key in sorted(params))
+        params["api_sig"] = md5(
+            (signature + self.api_credentials[1]).encode("utf-8")
+        ).hexdigest()
+        params["format"] = "json"
         try:
-            resp = urlopen(url, data_str)
-        except OSError:
-            print_d("Audioscrobbler server not responding, will try later.")
-            return False
+            try:
+                response = urlopen(
+                    self.base_url,
+                    urlencode(params).encode("ascii"),
+                    timeout=30,
+                )
+            except HTTPError as error:
+                # API errors (including expired sessions) can use HTTP 400/403.
+                response = error
+            with response:
+                result = json.loads(response.read().decode("utf-8"))
+        except (OSError, ValueError):
+            return None
+        if not isinstance(result, dict):
+            return None
+        if "error" in result:
+            if result["error"] == 9:
+                self.handshake_sent = False
+            if result["error"] in (4, 10, 26):
+                self.broken = True
+                self.changed_event.clear()
+            print_w(f"Scrobbling API error: {result['error']}")
+            return None
+        return result
 
-        resp_save = resp.read().decode("utf-8", "ignore")
-        status = resp_save.rstrip().split("\n")[0]
-        print_d(f"Submission status: {status}")
-        if status == "OK":
-            return True
-        if status == "BADSESSION":
-            self.handshake_sent = False
-            return False
-        return False
+    @staticmethod
+    def _api_song(song):
+        # Preserve cached scrobbles written by previous plugin versions.
+        fields = {
+            "a": "artist",
+            "t": "track",
+            "b": "album",
+            "n": "trackNumber",
+            "m": "mbid",
+            "l": "duration",
+            "i": "timestamp",
+            "albumArtist": "albumArtist",
+        }
+        return {fields[key]: value for key, value in song.items() if key in fields}
 
     def send_submission(self):
-        data = {"s": self.session_id}
-        to_submit = self.queue[: min(len(self.queue), 50)]
-        for idx, song in enumerate(to_submit):
-            for key, val in song.items():
-                data["%s[%d]" % (key, idx)] = val.encode("utf-8")
-            data["o[%d]" % idx] = "P"
-            data["r[%d]" % idx] = ""
-
-        song_info = "\n\t".join(f"{s['a']} - {s['t']}" for s in to_submit)
-        print_d(f"Submitting song(s): {song_info}")
-
-        if self._check_submit(self.submit_url, data):
-            del self.queue[: len(to_submit)]
+        songs = self.queue[:50]
+        if not songs:
+            return True
+        data = {"sk": self.api_session}
+        for idx, song in enumerate(songs):
+            data.update(
+                {f"{key}[{idx}]": val for key, val in self._api_song(song).items()}
+            )
+        result = self._api_request("track.scrobble", data)
+        if result is not None and "scrobbles" in result:
+            del self.queue[: len(songs)]
             return True
         return False
 
     def send_nowplaying(self):
-        data = {"s": self.session_id}
-        for key, val in self.nowplaying_song.items():
-            data[key] = val.encode("utf-8")
-        print_d(
-            "Now playing song: "
-            f"{self.nowplaying_song['a']} - {self.nowplaying_song['t']}"
-        )
-
-        return self._check_submit(self.nowplaying_url, data)
+        data = self._api_song(self.nowplaying_song)
+        data.pop("timestamp", None)
+        data["sk"] = self.api_session
+        result = self._api_request("track.updateNowPlaying", data)
+        return result is not None and "nowplaying" in result
 
     def quick_dialog_helper(self, dialog_type, msg):
         dialog = Message(dialog_type, app.window, "QLScrobbler", msg)
@@ -378,7 +372,7 @@ class QLScrobbler(EventPlugin):
     PLUGIN_NAME = _("AudioScrobbler Submission")
     PLUGIN_DESC = _(
         "Audioscrobbler client for Last.fm, Libre.fm and other "
-        "Audioscrobbler services."
+        "Scrobbling 2.0 services."
     )
     PLUGIN_ICON = Icons.NETWORK_WORKGROUP
 
@@ -503,13 +497,20 @@ class QLScrobbler(EventPlugin):
         box = Gtk.VBox(spacing=12)
 
         # first frame
-        table = Gtk.Table(n_rows=5, n_columns=2)
+        table = Gtk.Table(n_rows=7, n_columns=2)
         table.props.expand = False
         table.set_col_spacings(6)
         table.set_row_spacings(6)
 
         labels = []
-        label_names = [_("_Service:"), _("_URL:"), _("User_name:"), _("_Password:")]
+        label_names = [
+            _("_Service:"),
+            _("_URL:"),
+            _("User_name:"),
+            _("_Password:"),
+            _("API key:"),
+            _("API secret:"),
+        ]
         for idx, name in enumerate(label_names):
             label = Gtk.Label(label=name)
             label.set_alignment(0.0, 0.5)
@@ -567,21 +568,37 @@ class QLScrobbler(EventPlugin):
         labels[row].set_mnemonic_widget(entry)
         row += 1
 
+        for key in ("api_key", "api_secret"):
+            entry = UndoEntry()
+            entry.set_text(plugin_config.get(key))
+            entry.set_visibility(key != "api_secret")
+            entry.set_tooltip_text(
+                _(
+                    "Enter the API key and secret issued by your scrobbling service "
+                    "to authenticate with its Scrobbling 2.0 API."
+                )
+            )
+            entry.connect("changed", changed, key)
+            table.attach(entry, 1, 2, row, row + 1)
+            labels[row].set_mnemonic_widget(entry)
+            row += 1
+
         # verify data
         button = qltk.Button(_("_Verify account data"), Icons.DIALOG_INFORMATION)
         button.connect("clicked", check_login)
-        table.attach(button, 0, 2, 4, 5)
+        table.attach(button, 0, 2, row, row + 1)
 
         box.pack_start(qltk.Frame(_("Account"), child=table), True, True, 0)
 
         # second frame
-        table = Gtk.Table(n_rows=4, n_columns=2)
+        table = Gtk.Table(n_rows=5, n_columns=2)
         table.props.expand = False
         table.set_col_spacings(6)
         table.set_row_spacings(6)
 
         label_names = [
             _("_Artist pattern:"),
+            _("Album artist pattern:"),
             _("_Title pattern:"),
             _("Exclude _filter:"),
         ]
@@ -614,6 +631,20 @@ class QLScrobbler(EventPlugin):
                 "default."
             )
         )
+        labels[row].set_mnemonic_widget(entry)
+        row += 1
+
+        # album artist pattern
+        entry = UndoEntry()
+        entry.set_text(plugin_config.get("albumartistpat"))
+        entry.connect("changed", changed, "albumartistpat")
+        entry.set_tooltip_text(
+            _(
+                "The pattern used to format the album artist for submission. "
+                "Leave blank to use the albumartist tag."
+            )
+        )
+        table.attach(entry, 1, 2, row, row + 1)
         labels[row].set_mnemonic_widget(entry)
         row += 1
 

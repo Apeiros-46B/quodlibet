@@ -395,6 +395,9 @@ class AudioFile(dict, ImageContainer, HasKey):
                 return dict.get(self, real_key, config.RATINGS.default)
             elif key == "rating":
                 return util.format_rating(self("~#rating"))
+            elif key == "firstartist":
+                artists = self.list("artist")
+                return artists[0] if artists else default
             elif key == "people":
                 return "\n".join(self.list_unique(PEOPLE)) or default
             elif key == "people:real":

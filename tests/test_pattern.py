@@ -215,6 +215,19 @@ class TPattern(_TPattern):
         pat = Pattern("</The .+ way/|matched|not matched>")
         self.assertEqual(pat.format(self.g), "not matched")
 
+    def test_firstartist(self):
+        song = AudioFile({"artist": "First Artist\nSecond Artist"})
+        self.assertEqual(Pattern("<~firstartist>").format(song), "First Artist")
+        self.assertEqual(
+            Pattern("<~firstartist|<~firstartist>|Unknown>").format(song),
+            "First Artist",
+        )
+        self.assertEqual(Pattern("<~firstartist>").format(AudioFile()), "")
+        self.assertEqual(
+            Pattern("<~firstartist|<~firstartist>|Unknown>").format(AudioFile()),
+            "Unknown",
+        )
+
     def test_tag_internal(self):
         if os.name != "nt":
             pat = Pattern("<~filename='/path/to/a.mp3'|matched|not matched>")
