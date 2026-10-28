@@ -17,6 +17,7 @@ import os
 import threading
 import time
 from hashlib import md5
+from http.client import HTTPException
 from urllib.error import HTTPError
 from urllib.parse import urlencode
 
@@ -35,7 +36,6 @@ from quodlibet.qltk import Icons
 from quodlibet.util.dprint import print_d, print_w
 from quodlibet.util.picklehelper import pickle_load, pickle_dump, PickleError
 from quodlibet.util.urllib import urlopen
-from quodlibet.errorreport import errorhook
 
 SERVICES = {
     "Last.fm": "https://ws.audioscrobbler.com/2.0/",
@@ -87,47 +87,81 @@ def config_get_albumartist_pattern():
 
 
 class QLSubmitQueue:
-    """Manages the submit queue for scrobbles. Works independently of the
-    QLScrobbler plugin being enabled; other plugins may use submit() to queue
-    songs for scrobbling.
+    """One submission worker and its state, independent of playback events.
+
+    The condition protects queue/configuration state, never network I/O.
+    Deadlines are independent so a failed backlog cannot starve now-playing.
     """
 
     SCROBBLER_CACHE_FILE = os.path.join(quodlibet.get_user_dir(), "scrobbler_cache_v2")
+    RETRY_SECONDS = 60
 
-    # These objects are shared across instances, to allow other plugins to
-    # queue scrobbles in future versions of QL
-    queue: list[dict[str, str]] = []
-    changed_event = threading.Event()
+    def __init__(self, load_queue=True):
+        self._condition = threading.Condition(threading.RLock())
+        self._thread = None
+        self._stopped = False
+        self._generation = 0
+        self._auth_retry = self._submit_retry = self._nowplaying_retry = 0
+        self._auth_delay = self.RETRY_SECONDS
+        self.queue = []
+        self.nowplaying_song = None
+        self.nowplaying_sent = False
+        self.handshake_sent = False
+        self.broken = False
+        self.offline = False
+        self.api_credentials = ("", "")
+        self.api_session = None
+        self.username, self.password, self.base_url = ("", "", "")
+        self.titlepat = Pattern(config_get_title_pattern())
+        self.artpat = Pattern(config_get_artist_pattern())
+        self.albumartpat = Pattern(config_get_albumartist_pattern())
+        if load_queue:
+            self._load_queue()
+
+    def start(self):
+        self.changed()
+        with self._condition:
+            if self._thread is None or not self._thread.is_alive():
+                self._stopped = False
+                self._thread = threading.Thread(
+                    target=self.run, name="AudioScrobbler", daemon=True
+                )
+                self._thread.start()
+                print_d("Scrobbler: worker started")
+
+    def stop(self):
+        """Stop after any in-flight request; primarily useful for tests."""
+        with self._condition:
+            self._stopped = True
+            self._condition.notify_all()
 
     def set_nowplaying(self, song):
-        """Send a Now Playing notification."""
-        self._check_config()
-        formatted = self._format_song(song)
-        if not formatted or self.nowplaying_song == formatted:
-            return
-        self.nowplaying_song = formatted
-        self.nowplaying_sent = False
-        self.changed()
+        with self._condition:
+            self._check_config()
+            # Every playback occurrence gets a new object, including repeats.
+            self.nowplaying_song = self._format_song(song) if song is not None else None
+            self.nowplaying_sent = False
+            self._nowplaying_retry = 0
+            print_d(
+                f"Scrobbler: now-playing replaced; pending={bool(self.nowplaying_song)}"
+            )
+            self._condition.notify_all()
 
     def submit(self, song, timestamp=0):
-        """Submit a song. If 'timestamp' is 0, the current time will
-        be used."""
-        self._check_config()
-        formatted = self._format_song(song)
-        if formatted is None:
-            return
-        if timestamp > 0:
-            formatted["i"] = str(timestamp)
-        elif timestamp == 0:
-            formatted["i"] = str(int(time.time()))
-        else:
-            # TODO: Forging timestamps for submission from PMPs
-            return
-        self.queue.append(formatted)
-        self.changed()
+        with self._condition:
+            self._check_config()
+            formatted = self._format_song(song)
+            if formatted is None or timestamp < 0:
+                print_d(
+                    "Scrobbler: submission skipped (missing tags or invalid timestamp)"
+                )
+                return
+            formatted["i"] = str(timestamp or int(time.time()))
+            self.queue.append(formatted)
+            print_d(f"Scrobbler: queued track; queue={len(self.queue)}")
+            self._condition.notify_all()
 
     def _format_song(self, song):
-        """Returns a dict with the keys formatted as required by spec."""
         store = {
             "l": str(int(song.get("~#length", 0))),
             "n": str(song("~#track")),
@@ -137,58 +171,37 @@ class QLSubmitQueue:
             "a": self.artpat.format(song),
             "albumArtist": self.albumartpat.format(song),
         }
-
-        # Spec requires title and artist at minimum
-        if not (store.get("a") and store.get("t")):
-            return None
-        return store
-
-    def __init__(self):
-        self.nowplaying_song = None
-        self.nowplaying_sent = False
-        self.handshake_event = None
-        self.handshake_delay = 1.0
-        self.failures = 0
-        self.handshake_sent = 0
-
-        self.broken = False
-        self.api_credentials = ("", "")
-        self.api_session = None
-
-        self.username, self.password, self.base_url = ("", "", "")
-
-        # These need to be set early for _format_song to work
-        self.titlepat = Pattern(config_get_title_pattern())
-        self.artpat = Pattern(config_get_artist_pattern())
-        self.albumartpat = Pattern(config_get_albumartist_pattern())
-
-        self._load_queue()
+        return store if store["a"] and store["t"] else None
 
     def _load_queue(self):
         try:
-            with open(self.SCROBBLER_CACHE_FILE, "rb") as disk_queue_file:
-                disk_queue = pickle_load(disk_queue_file)
-            os.unlink(self.SCROBBLER_CACHE_FILE)
-            self.queue += disk_queue
+            with open(self.SCROBBLER_CACHE_FILE, "rb") as queue_file:
+                disk_queue = pickle_load(queue_file)
+            self.queue.extend(disk_queue)
+            print_d(f"Scrobbler: restored queue; queue={len(self.queue)}")
         except (OSError, PickleError):
             pass
 
-    @classmethod
-    def dump_queue(cls):
-        if cls.queue:
-            print_d(f"Saving scrobble queue to {cls.SCROBBLER_CACHE_FILE}")
+    def dump_queue(self):
+        with self._condition:
             try:
-                with open(cls.SCROBBLER_CACHE_FILE, "wb") as disk_queue_file:
-                    pickle_dump(cls.queue, disk_queue_file)
-            except (OSError, PickleError) as e:
-                print_w(f"Couldn't persist scrobble queue ({e})")
+                if self.queue:
+                    with open(self.SCROBBLER_CACHE_FILE, "wb") as queue_file:
+                        pickle_dump(self.queue, queue_file)
+                elif os.path.exists(self.SCROBBLER_CACHE_FILE):
+                    # Don't restore previously submitted tracks on next startup.
+                    os.unlink(self.SCROBBLER_CACHE_FILE)
+            except (OSError, PickleError) as error:
+                print_w(f"Couldn't persist scrobble queue ({type(error).__name__})")
 
     def _check_config(self):
-        user = plugin_config.get("username")
-        password = plugin_config.get("password")
-        url = config_get_url()
-        credentials = (plugin_config.get("api_key"), plugin_config.get("api_secret"))
-        settings = (user, password, url, credentials)
+        # Called on the main thread, with the condition held.
+        settings = (
+            plugin_config.get("username"),
+            plugin_config.get("password"),
+            config_get_url(),
+            (plugin_config.get("api_key"), plugin_config.get("api_secret")),
+        )
         if settings != (
             self.username,
             self.password,
@@ -196,91 +209,142 @@ class QLSubmitQueue:
             self.api_credentials,
         ):
             self.username, self.password, self.base_url, self.api_credentials = settings
+            self._generation += 1
             self.broken = False
             self.handshake_sent = False
             self.api_session = None
-        if not (user and password and all(credentials) and url.startswith("https://")):
-            if not self.broken and (self.queue or self.nowplaying_song):
-                self.quick_dialog(
-                    _(
-                        "Please configure a username, password, API key and API secret "
-                        "and an HTTPS API URL in the AudioScrobbler preferences."
-                    ),
-                    Gtk.MessageType.INFO,
-                )
-            self.broken = True
-        self.offline = plugin_config.getboolean("offline")
+            self._auth_retry = self._submit_retry = self._nowplaying_retry = 0
+            self._auth_delay = self.RETRY_SECONDS
+            self.nowplaying_sent = False
+            print_d(
+                "Scrobbler: account settings changed; authentication and retries reset"
+            )
+        self.broken = self.broken or not (
+            self.username
+            and self.password
+            and all(self.api_credentials)
+            and self.base_url.startswith("https://")
+        )
+        offline = plugin_config.getboolean("offline")
+        if offline != self.offline:
+            self._auth_retry = self._submit_retry = self._nowplaying_retry = 0
+            self.nowplaying_sent = False
+            print_d(f"Scrobbler: offline={offline}")
+        self.offline = offline
         self.titlepat = Pattern(config_get_title_pattern())
         self.artpat = Pattern(config_get_artist_pattern())
         self.albumartpat = Pattern(config_get_albumartist_pattern())
 
-    def changed(self):
-        """Signal that settings or queue contents were changed."""
-        self._check_config()
-        pending = self.queue or (self.nowplaying_song and not self.nowplaying_sent)
-        if not self.broken and not self.offline and pending:
-            self.changed_event.set()
-            return
-        self.changed_event.clear()
+    def changed(self, retry=False):
+        with self._condition:
+            if retry:
+                self.broken = False
+                self.handshake_sent = False
+                self._auth_retry = self._submit_retry = self._nowplaying_retry = 0
+                self._auth_delay = self.RETRY_SECONDS
+            self._check_config()
+            pending = bool(self.nowplaying_song) and not self.nowplaying_sent
+            print_d(
+                f"Scrobbler: wake; queue={len(self.queue)}, "
+                f"now-playing={pending}, "
+                f"blocked={self.broken}, offline={self.offline}"
+            )
+            self._condition.notify_all()
+
+    def _next_action(self):
+        """Called under the condition. Return an action or a wait timeout."""
+        now = time.monotonic()
+        pending_np = self.nowplaying_song is not None and not self.nowplaying_sent
+        if self.broken or self.offline or not (self.queue or pending_np):
+            return None, None
+        if not self.handshake_sent:
+            return (
+                ("auth", None)
+                if now >= self._auth_retry
+                else (None, self._auth_retry - now)
+            )
+        deadlines = []
+        if pending_np:
+            if now >= self._nowplaying_retry:
+                return "nowplaying", None
+            deadlines.append(self._nowplaying_retry)
+        if self.queue:
+            if now >= self._submit_retry:
+                return "submit", None
+            deadlines.append(self._submit_retry)
+        return None, min(deadlines) - now
+
+    def _finish_action(self, action, success):
+        now = time.monotonic()
+        if action == "auth":
+            self._auth_retry = 0 if success else now + self._auth_delay
+            self._auth_delay = (
+                self.RETRY_SECONDS if success else min(self._auth_delay * 2, 7200)
+            )
+            if success:
+                self._submit_retry = self._nowplaying_retry = 0
+        elif action == "submit":
+            self._submit_retry = 0 if success else now + self.RETRY_SECONDS
+        else:
+            self._nowplaying_retry = 0 if success else now + self.RETRY_SECONDS
+        deadline = {
+            "auth": self._auth_retry,
+            "submit": self._submit_retry,
+            "nowplaying": self._nowplaying_retry,
+        }[action]
+        print_d(
+            f"Scrobbler: {action} completed; success={success}, "
+            f"queue={len(self.queue)}, "
+            f"retry-in={max(0, deadline - now):.0f}s"
+        )
 
     def run(self):
-        """Submit songs from the queue. Call from a daemon thread."""
-        # The spec calls for exponential backoff of failed handshakes, with a
-        # minimum of 1m and maximum of 120m delay between attempts.
-        self.handshake_sent = False
-        self.handshake_event = threading.Event()
-        self.handshake_event.set()
-        self.handshake_delay = 1
-
-        self.failures = 0
-
         while True:
-            self.changed_event.wait()
-            if not self.handshake_sent:
-                self.handshake_event.wait()
-                if self.send_handshake():
-                    self.failures = 0
-                    self.handshake_delay = 1
-                    self.handshake_sent = True
-                else:
-                    self.handshake_event.clear()
-                    self.handshake_delay = min(self.handshake_delay * 2, 120)
-                    GLib.timeout_add(
-                        self.handshake_delay * 60 * 1000, self.handshake_event.set
-                    )
+            with self._condition:
+                if self._stopped:
+                    return
+                action, timeout = self._next_action()
+                if action is None:
+                    self._condition.wait(timeout)
                     continue
-            self.changed_event.wait()
-            if self.queue:
-                if self.send_submission():
-                    self.failures = 0
-                else:
-                    self.failures += 1
-                    self.changed_event.clear()
-                    GLib.timeout_add_seconds(60, self.changed)
-                    if self.failures >= 3:
-                        self.handshake_sent = False
-            elif self.nowplaying_song and not self.nowplaying_sent:
-                self.nowplaying_sent = self.send_nowplaying()
-                if not self.nowplaying_sent:
-                    self.changed_event.clear()
-                    GLib.timeout_add_seconds(60, self.changed)
-            else:
-                # Nothing left to do; wait until something changes
-                self.changed_event.clear()
+                generation = self._generation
+                nowplaying = self.nowplaying_song
+            try:
+                success = {
+                    "auth": self.send_handshake,
+                    "submit": self.send_submission,
+                    "nowplaying": self.send_nowplaying,
+                }[action]()
+            except Exception as error:
+                # A single unexpected failure must not kill the worker. Avoid
+                # exception text: third-party exceptions can contain credentials.
+                print_w(
+                    f"Scrobbler: {action} raised {type(error).__name__}; will retry"
+                )
+                success = False
+            with self._condition:
+                if generation == self._generation:
+                    if action != "nowplaying" or nowplaying is self.nowplaying_song:
+                        self._finish_action(action, success)
 
     def send_handshake(self, show_dialog=False):
-        """Authenticate against the Scrobbling 2.0 API."""
-        if self.broken:
-            return False
+        with self._condition:
+            if self.broken:
+                return False
+            generation = self._generation
+            params = {"username": self.username, "password": self.password}
         response = self._api_request(
-            "auth.getMobileSession",
-            {"username": self.username, "password": self.password},
+            "auth.getMobileSession", params, generation=generation
         )
         session = response.get("session") if response else None
-        if isinstance(session, dict) and session.get("key"):
-            self.api_session = session["key"]
-            self.handshake_sent = True
-            return True
+        with self._condition:
+            if generation != self._generation:
+                return False
+            if isinstance(session, dict) and session.get("key"):
+                self.api_session = session["key"]
+                self.handshake_sent = True
+                print_d("Scrobbler: authenticated")
+                return True
         if show_dialog:
             self.quick_dialog(
                 _("Authentication failed. Check your account and API credentials."),
@@ -288,37 +352,49 @@ class QLSubmitQueue:
             )
         return False
 
-    def _api_request(self, method, params):
-        params = dict(params, method=method, api_key=self.api_credentials[0])
+    def _api_request(self, method, params, generation=None):
+        with self._condition:
+            if generation is not None and generation != self._generation:
+                return None
+            generation = self._generation
+            api_key, secret = self.api_credentials
+            url = self.base_url
+        params = dict(params, method=method, api_key=api_key)
         signature = "".join(key + str(params[key]) for key in sorted(params))
-        params["api_sig"] = md5(
-            (signature + self.api_credentials[1]).encode("utf-8")
-        ).hexdigest()
+        params["api_sig"] = md5((signature + secret).encode("utf-8")).hexdigest()
         params["format"] = "json"
+        started = time.monotonic()
+        print_d(f"Scrobbler: request {method} started")
         try:
             try:
-                response = urlopen(
-                    self.base_url,
-                    urlencode(params).encode("ascii"),
-                    timeout=30,
-                )
+                response = urlopen(url, urlencode(params).encode("ascii"), timeout=30)
             except HTTPError as error:
-                # API errors (including expired sessions) can use HTTP 400/403.
                 response = error
             with response:
                 result = json.loads(response.read().decode("utf-8"))
-        except (OSError, ValueError):
+        except (OSError, ValueError, HTTPException) as error:
+            print_w(f"Scrobbler: {method} failed ({type(error).__name__}); will retry")
             return None
-        if not isinstance(result, dict):
-            return None
-        if "error" in result:
-            if result["error"] == 9:
-                self.handshake_sent = False
-            if result["error"] in (4, 10, 26):
-                self.broken = True
-                self.changed_event.clear()
-            print_w(f"Scrobbling API error: {result['error']}")
-            return None
+        print_d(
+            f"Scrobbler: request {method} finished in {time.monotonic() - started:.2f}s"
+        )
+        with self._condition:
+            if generation != self._generation:
+                print_d("Scrobbler: discarded response after account settings changed")
+                return None
+            if not isinstance(result, dict):
+                print_w(f"Scrobbler: {method} returned an invalid response")
+                return None
+            if "error" in result:
+                code = result["error"]
+                if code == 9:
+                    self.handshake_sent = False
+                    self.api_session = None
+                    self._auth_retry = 0
+                if code in (4, 10, 26):
+                    self.broken = True
+                print_w(f"Scrobbler: {method} API error {code}; blocked={self.broken}")
+                return None
         return result
 
     @staticmethod
@@ -337,26 +413,58 @@ class QLSubmitQueue:
         return {fields[key]: value for key, value in song.items() if key in fields}
 
     def send_submission(self):
-        songs = self.queue[:50]
+        with self._condition:
+            songs = self.queue[:50]
+            generation = self._generation
+            data = {"sk": self.api_session}
         if not songs:
             return True
-        data = {"sk": self.api_session}
         for idx, song in enumerate(songs):
             data.update(
                 {f"{key}[{idx}]": val for key, val in self._api_song(song).items()}
             )
-        result = self._api_request("track.scrobble", data)
-        if result is not None and "scrobbles" in result:
-            del self.queue[: len(songs)]
-            return True
+        result = self._api_request("track.scrobble", data, generation=generation)
+        with self._condition:
+            if (
+                generation == self._generation
+                and result is not None
+                and "scrobbles" in result
+            ):
+                del self.queue[: len(songs)]
+                self.dump_queue()
+                stats = result["scrobbles"]
+                if isinstance(stats, dict):
+                    counts = stats.get("@attr", {})
+                    if isinstance(counts, dict):
+                        print_d(
+                            "Scrobbler: batch response "
+                            f"accepted={counts.get('accepted')}, "
+                            f"ignored={counts.get('ignored')}"
+                        )
+                print_d(
+                    f"Scrobbler: submitted batch={len(songs)}; queue={len(self.queue)}"
+                )
+                return True
         return False
 
     def send_nowplaying(self):
-        data = self._api_song(self.nowplaying_song)
-        data.pop("timestamp", None)
-        data["sk"] = self.api_session
-        result = self._api_request("track.updateNowPlaying", data)
-        return result is not None and "nowplaying" in result
+        with self._condition:
+            song = self.nowplaying_song
+            generation = self._generation
+            if song is None:
+                return True
+            data = self._api_song(song)
+            data["sk"] = self.api_session
+        result = self._api_request(
+            "track.updateNowPlaying", data, generation=generation
+        )
+        success = result is not None and "nowplaying" in result
+        with self._condition:
+            if generation == self._generation and song is self.nowplaying_song:
+                self.nowplaying_sent = success
+            else:
+                print_d("Scrobbler: newer now-playing state preserved after response")
+        return success
 
     def quick_dialog_helper(self, dialog_type, msg):
         dialog = Message(dialog_type, app.window, "QLScrobbler", msg)
@@ -384,17 +492,6 @@ class QLScrobbler(EventPlugin):
         self.queue = QLSubmitQueue()
         self._tid = None
 
-        def queue_run():
-            try:
-                self.queue.run()
-            except Exception:
-                errorhook()
-
-        queue_thread = threading.Thread(None, queue_run)
-        queue_thread.setDaemon(True)
-        queue_thread.start()
-        print_d(f"Started Scrobbler thread {queue_thread}")
-
         self.start_time = 0
         self.unpaused_time = 0
         self.elapsed = 0
@@ -402,11 +499,19 @@ class QLScrobbler(EventPlugin):
 
         self.exclude = plugin_config.get("exclude")
 
+    def settings_changed(self, *args):
+        self.exclude = plugin_config.get("exclude")
+        self.queue.changed()
+        if self.__enabled:
+            song = getattr(app.player, "info", None) or app.player.song
+            self.send_nowplaying(song if not app.player.paused else None)
+
     def plugin_on_song_ended(self, song, stopped):
         if song is None or not self.__enabled:
             return
         if self.unpaused_time > 0:
-            self.elapsed += time.time() - self.unpaused_time
+            self.elapsed += time.monotonic() - self.unpaused_time
+            self.unpaused_time = 0
         # Spec: * don't submit when song length < 00:30
         #       * submit at end of playback (not in the middle, as with v1.1)
         #       * submit if played for >= .5*length or >= 240s
@@ -420,6 +525,7 @@ class QLScrobbler(EventPlugin):
             print_d("Not submitting: {}".format(song("~artist~title")))
             return
         self.queue.submit(song, self.start_time)
+        self.queue.set_nowplaying(None)
 
     def song_excluded(self, song):
         if self.exclude and Query(self.exclude).search(song):
@@ -428,68 +534,85 @@ class QLScrobbler(EventPlugin):
         return False
 
     def send_nowplaying(self, song):
-        if not self.song_excluded(song):
-            self.queue.set_nowplaying(song)
+        self.queue.set_nowplaying(
+            song if song is not None and not self.song_excluded(song) else None
+        )
 
     def plugin_on_song_started(self, song):
+        self.nowplaying = song
+        self.queue.set_nowplaying(None)
         if song is None:
+            self.unpaused_time = 0
+            self.elapsed = 0
             return
         self.start_time = int(time.time())
         if app.player.paused:
             self.unpaused_time = 0
         else:
-            self.unpaused_time = time.time()
+            self.unpaused_time = time.monotonic()
         self.elapsed = 0
         if self.__enabled and not app.player.paused:
             self.send_nowplaying(song)
-        else:
-            self.nowplaying = song
 
     def plugin_on_paused(self):
         if self.unpaused_time > 0:
-            self.elapsed += time.time() - self.unpaused_time
+            self.elapsed += time.monotonic() - self.unpaused_time
         self.unpaused_time = 0
+        self.queue.set_nowplaying(None)
+        print_d("Scrobbler: playback paused")
 
     def plugin_on_unpaused(self):
-        self.unpaused_time = time.time()
+        self.unpaused_time = time.monotonic()
         if self.__enabled and self.nowplaying:
             self.send_nowplaying(self.nowplaying)
-            self.nowplaying = None
+        print_d("Scrobbler: playback resumed")
 
     def enabled(self):
         self.__enabled = True
-        print_d("Plugin enabled - accepting new songs.")
+        print_d("Scrobbler: plugin enabled")
+        self.queue.start()
+        self.queue.changed(retry=True)
+        self.plugin_on_song_started(
+            getattr(app.player, "info", None) or app.player.song
+        )
         if not self._tid:
             print_d("Starting scrobble autosaver")
             self._tid = GLib.timeout_add_seconds(
-                self.AUTOSAVE_INTERVAL, lambda: QLSubmitQueue.dump_queue() or True
+                self.AUTOSAVE_INTERVAL, lambda: self.queue.dump_queue() or True
             )
 
     def disabled(self):
         self.__enabled = False
-        print_d("Plugin disabled - not accepting any new songs.")
+        print_d("Scrobbler: plugin disabled; queued submissions may still drain")
+        self.queue.set_nowplaying(None)
+        self.nowplaying = None
+        self.unpaused_time = 0
         if self._tid:
             print_d("Stopping scrobble autosaver")
             GLib.source_remove(self._tid)
             self._tid = None
-        QLSubmitQueue.dump_queue()
+        self.queue.dump_queue()
 
     def PluginPreferences(self, parent):
         def changed(entry, key):
             if entry.get_property("sensitive"):
                 plugin_config.set(key, entry.get_text())
+                self.settings_changed()
 
         def combo_changed(widget, urlent):
             service = widget.get_active_text()
             plugin_config.set("service", service)
             urlent.set_sensitive(service not in SERVICES)
             urlent.set_text(config_get_url())
+            self.settings_changed()
 
         def check_login(*args):
-            queue = QLSubmitQueue()
-            queue.changed()
+            # Verification has isolated state and never loads the pending queue.
+            queue = QLSubmitQueue(load_queue=False)
+            queue.changed(retry=True)
             status = queue.send_handshake(show_dialog=True)
             if status:
+                self.queue.changed(retry=True)
                 queue.quick_dialog(
                     _("Authentication successful."), Gtk.MessageType.INFO
                 )
@@ -675,6 +798,7 @@ class QLScrobbler(EventPlugin):
         offline = plugin_config.ConfigCheckButton(
             _("_Offline mode (don't submit anything)"), "offline", populate=True
         )
+        offline.connect("toggled", self.settings_changed)
         table.attach(offline, 0, 2, row, row + 1)
 
         box.pack_start(qltk.Frame(_("Submission"), child=table), True, True, 0)
